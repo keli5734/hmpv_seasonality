@@ -1,0 +1,436 @@
+library(deSolve)
+library(dplyr)
+library(tidyr)
+library(parallel)
+library(doParallel)
+library(foreach)
+
+set.seed(20260301)
+
+# ─────────────────────────────────────────────
+# 1. Load data
+# ─────────────────────────────────────────────
+clean_data        <- readRDS("hmpv_data_combined.rds")
+RSV_data          <- readRDS("nrevss_raw_scaled_RSV.rds")
+region            <- 1
+my_region         <- 1
+fitted_parameters <- readRDS(paste0("parm_Oct28/parm_", region, ".rds"))
+
+RSV_incidence <- RSV_data %>% dplyr::filter(regions == region) %>% pull(scaled_cases)
+
+RSV_average <- RSV_data %>%
+  dplyr::filter(regions == region) %>%
+  group_by(epi_week_cdc) %>%
+  summarise(rsv_ave = mean(scaled_cases)) %>%
+  pull(rsv_ave)
+
+hmpv      <- clean_data$ts_data  %>% filter(regions == region) %>% pull(raw_cases)
+age_dist  <- clean_data$age_dist %>% filter(Regions == region) %>% pull(prop)
+test_dist <- clean_data$age_dist %>% filter(Regions == region) %>% pull(hmpv_tests_average)
+
+my_data <- list(
+  hmpv = hmpv,
+  prop = round(age_dist * sum(hmpv)),
+  test = test_dist / 100
+)
+
+# ─────────────────────────────────────────────
+# 2. Source model and shared parameters
+# ─────────────────────────────────────────────
+source("fit_hosp_data_fn.R")
+
+parm_for_fit$data_rsv <- c(rep(RSV_average, length.out = length(B_part2)), RSV_incidence)
+parm_for_fit$data_rsv <- (parm_for_fit$data_rsv - min(parm_for_fit$data_rsv)) /
+  (max(parm_for_fit$data_rsv) - min(parm_for_fit$data_rsv))
+
+parm_for_fit$reporting_fraction1 <- fitted_parameters$reporting_fraction1
+parm_for_fit$reporting_fraction2 <- fitted_parameters$reporting_fraction2
+parm_for_fit$reporting_fraction3 <- fitted_parameters$reporting_fraction3
+parm_for_fit$reporting_fraction4 <- fitted_parameters$reporting_fraction4
+parm_for_fit$reporting_fraction5 <- fitted_parameters$reporting_fraction5
+
+# ─────────────────────────────────────────────
+# 3. Generate random starting values
+# ─────────────────────────────────────────────
+n_starts <- 20  # number of random starts (adjust based on cores/time)
+
+starts_list <- replicate(n_starts, c(
+  trans     = runif(1, -2,  2),
+  amplitude = runif(1, -3,  0),
+  transmiss = runif(1, log(2.8), log(5)),
+  f         = runif(1, -5,  0)
+), simplify = FALSE)
+
+# Always include the original start as first candidate
+starts_list[[1]] <- c(trans = 1, amplitude = -1.2, transmiss = log(3), f = -2)
+
+cat(sprintf("Running %d starts in parallel\n", n_starts))
+
+# ─────────────────────────────────────────────
+# 4. Parallel MLE
+# ─────────────────────────────────────────────
+# n_cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = "1"))
+# cat(sprintf("Using %d cores\n", n_cores))
+# 
+# # Progress tracking setup
+# progress_dir <- paste0("mle_progress_region", region)
+# dir.create(progress_dir, showWarnings = FALSE)
+# file.remove(list.files(progress_dir, full.names = TRUE))
+# cat(sprintf("Monitor progress: ls %s/ | wc -l  (out of %d)\n", progress_dir, n_starts))
+# 
+# cl <- makeCluster(n_cores)
+# registerDoParallel(cl)
+# 
+# clusterEvalQ(cl, {
+#   library(deSolve)
+#   library(dplyr)
+# })
+# 
+# clusterExport(cl, varlist = c(
+#   "fit_hosp_data_fn",
+#   "hmpv_transmission_model_viral_interference",
+#   "parm_for_fit",
+#   "my_data",
+#   "yinit.vector", "yinit.matrix",
+#   "my_times", "t_burn_in", "N_ages", "B_part2",
+#   "rho1", "rho2", "sigma1", "sigma2", "sigma3",
+#   "region",
+#   "progress_dir"
+# ))
+
+# all_fits <- foreach(
+#   start     = starts_list,
+#   istart    = seq_along(starts_list),
+#   .combine  = c,
+#   .packages = c("deSolve", "dplyr")
+# ) %dopar% {
+#   
+#   t_start <- proc.time()["elapsed"]
+#   
+#   fit <- tryCatch(
+#     optim(
+#       par     = start,
+#       fn      = fit_hosp_data_fn,
+#       dat     = my_data,
+#       method  = "L-BFGS-B",
+#       lower   = c(trans = -Inf, amplitude = -Inf, transmiss = log(2.8), f = -Inf),
+#       upper   = c(trans =  Inf, amplitude =  Inf, transmiss = log(5),   f =  0),
+#       control = list(trace = FALSE, factr = 1e10, pgtol = 1e-4)
+#     ),
+#     error = function(e) list(value = Inf, convergence = 99L)
+#   )
+#   
+#   t_elapsed <- round(proc.time()["elapsed"] - t_start, 1)
+#   
+#   # Write progress file
+#   writeLines(
+#     c(sprintf("start    : %d",    istart),
+#       sprintf("nll      : %.4f", fit$value),
+#       sprintf("conv     : %d",   fit$convergence),
+#       sprintf("time_s   : %.1f", t_elapsed)),
+#     file.path(progress_dir, sprintf("done_start%02d.txt", istart))
+#   )
+#   
+#   list(fit)
+# }
+# 
+# stopCluster(cl)
+
+# ─────────────────────────────────────────────
+# 5. Pick the best fit across all starts
+# ─────────────────────────────────────────────
+# nll_vals <- sapply(all_fits, function(f) f$value)
+# cat("\nNLL values across starts:\n")
+# print(round(sort(nll_vals), 3))
+# 
+# best_idx <- which.min(nll_vals)
+# fitLL    <- all_fits[[best_idx]]
+# cat(sprintf("\nBest start: #%d | NLL: %.4f | convergence: %d\n",
+#             best_idx, fitLL$value, fitLL$convergence))
+
+# ─────────────────────────────────────────────
+# 6. Save results
+# ─────────────────────────────────────────────
+# mle_nll   <- fitLL$value
+# mle_f_int <- -plogis(fitLL$par["f"])
+# cat("MLE f_int:", mle_f_int, " | MLE -loglik:", mle_nll, "\n")
+# 
+# parms_mle <- c(parm_for_fit,
+#                phi               = plogis(fitLL$par["trans"]),
+#                Amp               = plogis(fitLL$par["amplitude"]),
+#                baseline.txn.rate = exp(fitLL$par["transmiss"]),
+#                f_int             = mle_f_int)
+# 
+# saveRDS(parms_mle, paste0("parm_",  region, "_viral_interference.rds"))
+# saveRDS(fitLL,     paste0("fitLL_", region, "_viral_interference.rds"))
+# cat("Saved parms and fitLL.\n")
+
+
+
+
+# ─────────────────────────────────────────────
+# 3. Load MLE results
+# ─────────────────────────────────────────────
+parms_mle <- readRDS(paste0("parm_",  region, "_viral_interference.rds"))
+fitLL     <- readRDS(paste0("fitLL_", region, "_viral_interference.rds"))
+mle_nll   <- fitLL$value
+mle_f_int <- -plogis(fitLL$par["f"])
+cat("MLE f_int:", mle_f_int, " | MLE -loglik:", mle_nll, "\n")
+
+# ─────────────────────────────────────────────
+# 4. Profile likelihood wrapper
+# ─────────────────────────────────────────────
+fit_hosp_data_fn_profile <- function(par, dat, f_int_fixed) {
+  f_pinned <- qlogis(-f_int_fixed)
+  full_par <- c(trans     = unname(par[1]),
+                amplitude = unname(par[2]),
+                transmiss = unname(par[3]),
+                f         = f_pinned)
+  fit_hosp_data_fn(parameters = full_par, dat = dat)
+}
+
+# ─────────────────────────────────────────────
+# 5. Build grid (wide sweep + dense near MLE)
+# ─────────────────────────────────────────────
+f_int_grid <- sort(unique(c(
+  # Extended lower tail dynamically connecting to the dense band
+  seq(-0.50, mle_f_int - 0.08, length.out = 20),
+  
+  # Dense band around MLE
+  seq(mle_f_int - 0.16, mle_f_int + 0.16, length.out = 25),
+  
+  # Extended upper tail to prevent right boundary censoring
+  seq(mle_f_int + 0.16, -0.001, length.out = 20)
+)))
+
+# Ensure we don't accidentally exceed the absolute boundaries 
+# (in case mle_f_int is very close to -0.50 or -0.001)
+#f_int_grid <- f_int_grid[f_int_grid >= -0.50 & f_int_grid <= -0.001]
+
+cat("Grid points:", length(f_int_grid), "\n")
+
+# ─────────────────────────────────────────────
+# 6. Build a set of starting values for multi-start
+#    Each grid point will be attempted from all of these.
+#    Using MLE params as anchor + small perturbations.
+# ─────────────────────────────────────────────
+mle_start <- c(
+  trans     = unname(fitLL$par["trans"]),
+  amplitude = unname(fitLL$par["amplitude"]),
+  transmiss = unname(fitLL$par["transmiss"])
+)
+
+set.seed(42)
+n_extra_starts <- 4   # additional random starts per grid point
+
+extra_starts <- replicate(n_extra_starts, {
+  mle_start + rnorm(3, mean = 0, sd = c(0.3, 0.3, 0.15))
+}, simplify = FALSE)
+
+# Clamp transmiss within [log(2.8), log(5)] for each extra start
+extra_starts <- lapply(extra_starts, function(s) {
+  s["transmiss"] <- pmax(log(2.8), pmin(log(5), s["transmiss"]))
+  s
+})
+
+all_starts <- c(list(mle_start), extra_starts)
+cat(sprintf("Multi-start: %d starts per grid point\n", length(all_starts)))
+
+# ─────────────────────────────────────────────
+# 7. Inner optimizer: try L-BFGS-B, fall back to Nelder-Mead
+# ─────────────────────────────────────────────
+run_one_start <- function(start, dat, fval) {
+  
+  # ── Attempt 1: L-BFGS-B (tighter tolerances than before) ──
+  fit <- tryCatch(
+    optim(
+      par         = start,
+      fn          = fit_hosp_data_fn_profile,
+      dat         = dat,
+      f_int_fixed = fval,
+      method      = "L-BFGS-B",
+      lower       = c(trans = -Inf, amplitude = -Inf, transmiss = log(2.8)),
+      upper       = c(trans =  Inf, amplitude =  Inf, transmiss = log(5)),
+      control     = list(
+        trace = FALSE,
+        maxit = 2000,
+        factr = 1e7,    # tighter than 1e10; try 1e6 if still struggling
+        pgtol = 1e-4
+      )
+    ),
+    error = function(e) list(value = Inf, convergence = 99L, msg = e$message)
+  )
+  
+  # ── Attempt 2: Nelder-Mead fallback if L-BFGS-B failed/diverged ──
+  if (fit$convergence != 0L || !is.finite(fit$value)) {
+    fit_nm <- tryCatch(
+      optim(
+        par         = start,
+        fn          = fit_hosp_data_fn_profile,
+        dat         = dat,
+        f_int_fixed = fval,
+        method      = "Nelder-Mead",
+        control     = list(
+          trace   = FALSE,
+          maxit   = 5000,
+          reltol  = 1e-8,
+          abstol  = 1e-8
+        )
+      ),
+      error = function(e) list(value = Inf, convergence = 99L, msg = e$message)
+    )
+    # Keep whichever is better
+    if (is.finite(fit_nm$value) && fit_nm$value < fit$value) {
+      fit <- fit_nm
+    }
+  }
+  
+  fit
+}
+
+# ─────────────────────────────────────────────
+# 8. Parallel profile loop (multi-start per grid point)
+# ─────────────────────────────────────────────
+n_cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = "1"))
+cat(sprintf("Using %d cores\n", n_cores))
+
+progress_dir <- paste0("profile_progress_region", region)
+dir.create(progress_dir, showWarnings = FALSE)
+file.remove(list.files(progress_dir, full.names = TRUE))
+cat(sprintf("Monitor with: watch -n 30 \"ls %s/ | wc -l\"  (of %d)\n",
+            progress_dir, length(f_int_grid)))
+
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {
+  library(deSolve)
+  library(dplyr)
+})
+
+clusterExport(cl, varlist = c(
+  "fit_hosp_data_fn",
+  "fit_hosp_data_fn_profile",
+  "run_one_start",
+  "hmpv_transmission_model_viral_interference",
+  "parm_for_fit",
+  "my_data",
+  "all_starts",
+  "yinit.vector", "yinit.matrix",
+  "my_times", "t_burn_in", "N_ages", "B_part2",
+  "rho1", "rho2", "sigma1", "sigma2", "sigma3",
+  "region",
+  "progress_dir"
+))
+
+profile_results <- foreach(
+  fval     = f_int_grid,
+  .combine = rbind,
+  .packages = c("deSolve", "dplyr")
+) %dopar% {
+  
+  t_start <- proc.time()["elapsed"]
+  
+  # ── Run all starts, keep the best ──────────
+  best <- list(value = Inf, convergence = 99L, msg = "no starts run")
+  
+  for (s in all_starts) {
+    fit_i <- run_one_start(start = s, dat = my_data, fval = fval)
+    
+    if (is.finite(fit_i$value) && fit_i$value < best$value) {
+      best <- fit_i
+    }
+    
+    # Early-exit: if we found a good converged solution, stop trying more starts
+    if (best$convergence == 0L && is.finite(best$value)) break
+  }
+  # ───────────────────────────────────────────
+  
+  t_elapsed <- round(proc.time()["elapsed"] - t_start, 1)
+  
+  writeLines(
+    c(sprintf("f_int  : %.6f", fval),
+      sprintf("nll    : %.4f", best$value),
+      sprintf("conv   : %d",   best$convergence),
+      sprintf("time_s : %.1f", t_elapsed)),
+    file.path(progress_dir, paste0("done_", make.names(fval), ".txt"))
+  )
+  
+  data.frame(
+    f_int     = fval,
+    nll       = if (is.finite(best$value)) best$value else NA_real_,
+    converged = (best$convergence == 0L),
+    time_s    = t_elapsed,
+    msg       = if (!is.null(best$msg)) best$msg else ""
+  )
+}
+
+stopCluster(cl)
+saveRDS(profile_results, paste0("profile_fint_region", region, ".rds"))
+cat("\nProfile loop complete. Results saved.\n")
+
+# ─────────────────────────────────────────────
+# 9. Diagnostics + CI
+# ─────────────────────────────────────────────
+cat("\n--- Profile results summary ---\n")
+cat("Total grid points :", nrow(profile_results), "\n")
+cat("Converged         :", sum(profile_results$converged, na.rm = TRUE), "\n")
+cat("NAs in nll        :", sum(is.na(profile_results$nll)), "\n")
+cat("NLL range         :", range(profile_results$nll, na.rm = TRUE), "\n")
+cat("Avg time per job  :", round(mean(profile_results$time_s, na.rm = TRUE), 1), "seconds\n")
+cat("MLE NLL           :", mle_nll, "\n")
+
+threshold <- mle_nll + qchisq(0.95, df = 1) / 2
+cat("95% threshold     :", threshold, "\n\n")
+
+good <- profile_results %>% filter(converged, !is.na(nll), nll <= threshold)
+
+if (nrow(good) == 0) {
+  stop("No profile points below threshold — check worker environment or function guards.")
+}
+
+ci_vals <- good %>% summarise(lower = min(f_int), upper = max(f_int))
+
+cat(sprintf("Profile-likelihood 95%% CI for f_int: [%.4f, %.4f]\n",
+            ci_vals$lower, ci_vals$upper))
+
+if (ci_vals$lower <= min(f_int_grid) + 0.01)
+  warning("Lower CI boundary may be censored — extend grid below ",
+          round(min(f_int_grid), 3))
+if (ci_vals$upper >= max(f_int_grid) - 0.01)
+  warning("Upper CI boundary may be censored — extend grid above ",
+          round(max(f_int_grid), 3))
+
+# ─────────────────────────────────────────────
+# 10. Plot
+# ─────────────────────────────────────────────
+prof_plot <- profile_results %>% filter(converged, !is.na(nll)) %>% arrange(f_int)
+non_conv  <- profile_results %>% filter(!converged | is.na(nll))
+
+plot(prof_plot$f_int, prof_plot$nll,
+     type = "l", lwd = 2,
+     xlab = "f_int (viral interference strength)",
+     ylab = "-log likelihood",
+     main = paste0("Profile Likelihood: f_int  (Region ", region, ")"))
+
+points(mle_f_int, mle_nll, pch = 19, col = "darkgreen", cex = 1.4)
+text(mle_f_int, mle_nll,
+     labels = sprintf("MLE = %.3f", mle_f_int),
+     pos = 3, col = "darkgreen", cex = 0.85)
+
+abline(h = threshold,     col = "red",  lty = 2, lwd = 1.5)
+abline(v = ci_vals$lower, col = "blue", lty = 2)
+abline(v = ci_vals$upper, col = "blue", lty = 2)
+
+text(par("usr")[1], threshold,
+     labels = "95% cutoff", col = "red", adj = c(0, -0.4), cex = 0.8)
+text(ci_vals$lower, par("usr")[4],
+     sprintf("%.3f", ci_vals$lower), col = "blue", adj = c(0, 1), cex = 0.8)
+text(ci_vals$upper, par("usr")[4],
+     sprintf("%.3f", ci_vals$upper), col = "blue", adj = c(1, 1), cex = 0.8)
+
+if (nrow(non_conv) > 0) {
+  points(non_conv$f_int, rep(par("usr")[4], nrow(non_conv)),
+         pch = 4, col = "orange", cex = 1.2)
+  warning(sprintf("%d grid point(s) did not converge.", nrow(non_conv)))
+}
